@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 极速台球 - Web大师版</title>
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background-color: #111; 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none; 
+        }
+        
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        #score-panel {
+            margin-top: 20px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 10px 30px;
+            border-radius: 30px;
+            color: #4CAF50;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.5);
+            backdrop-filter: blur(5px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        #controls-hint {
+            margin-top: 10px;
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 14px;
+            text-align: center;
+            line-height: 1.5;
+        }
+
+        #power-meter {
+            display: none;
+            position: absolute;
+            bottom: 50px;
+            width: 200px;
+            height: 10px;
+            background: #333;
+            border-radius: 5px;
+            overflow: hidden;
+            border: 2px solid #fff;
+        }
+
+        #power-bar {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, #4CAF50, #FFC107, #F44336);
+            transition: width 0.1s;
+        }
+
+        .key {
+            background: rgba(255,255,255,0.2);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: bold;
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- UI 界面 -->
+    <div id="ui-layer">
+        <div id="score-panel">已进球: <span id="score">0</span></div>
+        <div id="controls-hint">
+            🖱️ <span class="key">左键拖拽白球</span> 蓄力射击<br>
+            🖱️ <span class="key">右键拖拽</span> 旋转视角 | <span class="key">滚轮</span> 缩放
+        </div>
+        <div id="power-meter"><div id="power-bar"></div></div>
+    </div>
+
+    <!-- 模块化引入 Three.js 和 Cannon-es -->
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+          "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+        }
+      }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import * as CANNON from 'cannon-es';
+
+        // --- 游戏配置 ---
+        const CONFIG = {
+            tableWidth: 15,
+            tableLength: 28,
+            ballRadius: 0.5,
+            pocketRadius: 1.2,
+            wallHeight: 1.0,
+            colors: {
+                felt: 0x2E8B57, // 台呢绿
+                wood: 0x5C4033, // 桃花心木
+                cue: 0xFFFFFF   // 白球
+            }
+        };
+
+        // --- 全局变量 ---
+        let scene, camera, renderer, controls;
+        let world; // 物理世界
+        let balls = []; // 存储球体对象 { mesh, body, isCue, startPos }
+        let cueBall = null;
+        let raycaster = new THREE.Raycaster();
+        let mouse = new THREE.Vector2();
+        let score = 0;
+        
+        // 交互状态
+        let isDragging = false;
+        let dragStartPos = new THREE.Vector2();
+        let aimLine;
+        
+        // 材质管理
+        let materials = {};
+
+        init();
+        animate();
+
+        function init() {
+            setupScene();
+            setupPhysics();
+            createTable();
+            createBalls();
+            setupInteraction();
+            
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // 1. 场景搭建
+        function setupScene() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a1a);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 25, 20);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement);
+
+            // 灯光
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(10, 30, 10);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            dirLight.shadow.camera.left = -20;
+            dirLight.shadow.camera.right = 20;
+            dirLight.shadow.camera.top = 20;
+            dirLight.shadow.camera.bottom = -20;
+            scene.add(dirLight);
+
+            // 控制器
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enablePan = false;
+            controls.maxPolarAngle = Math.PI / 2 - 0.1; // 防止视角穿透地面
+            controls.minDistance = 10;
+            controls.maxDistance = 50;
+        }
+
+        // 2. 物理引擎设置
+        function setupPhysics() {
+            world = new CANNON.World();
+            world.gravity.set(0, -9.82, 0);
+            world.broadphase = new CANNON.SAPBroadphase(world);
+            world.solver.iterations = 10;
+
+            // 定义物理材质
+            const ballMat = new CANNON.Material('ball');
+            const tableMat = new CANNON.Material('table');
+            const wallMat = new CANNON.Material('wall');
+
+            // 定义材质间的接触行为
+            const ballTableContact = new CANNON.ContactMaterial(ballMat, tableMat, {
+                friction: 0.3,
+                restitution: 0.2 // 稍微有点弹性
+            });
+            const ballWallContact = new CANNON.ContactMaterial(ballMat, wallMat, {
+                friction: 0.4,
+                restitution: 0.6 // 库边反弹强
+            });
+            const ballBallContact = new CANNON.ContactMaterial(ballMat, ballMat, {
+                friction: 0.2,
+                restitution: 0.85 // 球体碰撞弹性大
+            });
+
+            world.addContactMaterial(ballTableContact);
+            world.addContactMaterial(ballWallContact);
+            world.addContactMaterial(ballBallContact);
+
+            materials = { ball: ballMat, table: tableMat, wall: wallMat };
+        }
+
+        // 3. 创建球桌
+        function createTable() {
+            const w = CONFIG.tableWidth;
+            const l = CONFIG.tableLength;
+            
+            // --- 渲染部分 ---
+            
+            // 台呢 (Mesh)
+            const feltGeo = new THREE.BoxGeometry(w, 0.5, l);
+            const feltMat = new THREE.MeshStandardMaterial({ 
+                color: CONFIG.colors.felt, 
+                roughness: 0.8,
+                metalness: 0.1
+            });
+            const feltMesh = new THREE.Mesh(feltGeo, feltMat);
+            feltMesh.position.y = -0.25;
+            feltMesh.receiveShadow = true;
+            scene.add(feltMesh);
+
+            // 边框 (Wood Mesh)
+            const frameGeo = new THREE.BoxGeometry(w + 2, 1, l + 2);
+            const frameMat = new THREE.MeshStandardMaterial({ 
+                color: CONFIG.colors.wood,
+                roughness: 0.4
+            });
+            const frameMesh = new THREE.Mesh(frameGeo, frameMat);
+            frameMesh.position.y = -0.5;
+            frameMesh.receiveShadow = true;
+            scene.add(frameMesh);
+
+            // --- 物理部分 ---
+            
+            // 地面 (Infinite Plane for safety, using box here for simplicity)
+            const floorShape = new CANNON.Box(new CANNON.Vec3(w/2, 0.25, l/2));
+            const floorBody = new CANNON.Body({ mass: 0, material: materials.table });
+            floorBody.addShape(floorShape, new CANNON.Vec3(0, -0.25, 0));
+            world.addBody(floorBody);
+
+            // 库边墙壁生成器
+            const createWall = (width, depth, x, z) => {
+                // Visual
+                const geo = new THREE.BoxGeometry(width, CONFIG.wallHeight, depth);
+                const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({color: 0x1E5B37}));
+                mesh.position.set(x, 0.5, z);
+                mesh.castShadow = true;
+                scene.add(mesh);
+                
+                // Physics
+                const shape = new CANNON.Box(new CANNON.Vec3(width/2, CONFIG.wallHeight/2, depth/2));
+                const body = new CANNON.Body({ mass: 0, material: materials.wall });
+                body.addShape(shape, new CANNON.Vec3(x, 0.5, z));
+                world.addBody(body);
+            };
+
+            // 四个库边 (留出洞口间隙的简单处理)
+            // 上下
+            createWall(w + 2, 1, 0, -l/2 - 0.5);
+            createWall(w + 2, 1, 0, l/2 + 0.5);
+            // 左右
+            createWall(1, l, -w/2 - 0.5, 0);
+            createWall(1, l, w/2 + 0.5, 0);
+        }
+
+        // 4. 创建球体
+        function createBalls() {
+            const sphereGeo = new THREE.SphereGeometry(CONFIG.ballRadius, 32, 32);
+            
+            const spawnBall = (x, z, color, isCue = false) => {
+                // Visual
+                const mesh = new THREE.Mesh(sphereGeo, new THREE.MeshStandardMaterial({
+                    color: color,
+                    roughness: 0.1, // 光滑
+                    metalness: 0.3 // 有点金属光泽
+                }));
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                scene.add(mesh);
+
+                // Physics
+                const shape = new CANNON.Sphere(CONFIG.ballRadius);
+                const body = new CANNON.Body({
+                    mass: 1, // 标准质量
+                    material: materials.ball,
+                    linearDamping: 0.3, // 模拟滚动摩擦阻力
+                    angularDamping: 0.3
+                });
+                body.addShape(shape);
+                body.position.set(x, CONFIG.ballRadius, z);
+                world.addBody(body);
+
+                const ballObj = { mesh, body, isCue, startPos: new THREE.Vector3(x, CONFIG.ballRadius, z) };
+                balls.push(ballObj);
+                if(isCue) cueBall = ballObj;
+            };
+
+            // 白球
+            spawnBall(0, CONFIG.tableLength / 4, CONFIG.colors.cue, true);
+
+            // 彩球 (摆成三角形)
+            const startZ = -CONFIG.tableLength / 4;
+            const r = CONFIG.ballRadius;
+            const rowDist = Math.sqrt(3) * r;
+            // 随机颜色
+            const colors = [0xFFFF00, 0x0000FF, 0xFF0000, 0x800080, 0xFFA500, 0x006400, 0x8B0000, 0x000000];
+            let colorIdx = 0;
+
+            for (let row = 0; row < 5; row++) {
+                for (let i = 0; i <= row; i++) {
+                    const x = (i - row * 0.5) * 2.1 * r;
+                    const z = startZ - row * rowDist * 1.05;
+                    spawnBall(x, z, colors[colorIdx % colors.length]);
+                    colorIdx++;
+                }
+            }
+        }
+
+        // 5. 交互逻辑
+        function setupInteraction() {
+            // 瞄准线
+            const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+            const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,0)]);
+            aimLine = new THREE.Line(lineGeo, lineMat);
+            aimLine.visible = false;
+            scene.add(aimLine);
+
+            window.addEventListener('mousedown', onMouseDown);
+            window.addEventListener('mousemove', onMouseMove);
+            window.addEventListener('mouseup', onMouseUp);
+        }
+
+        function onMouseDown(e) {
+            if (e.button !== 0) return; // 只响应左键
+
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(cueBall.mesh);
+
+            if (intersects.length > 0) {
+                // 只有当球基本静止时才允许击球
+                if (cueBall.body.velocity.length() < 0.1) {
+                    isDragging = true;
+                    controls.enabled = false; // 锁定视角
+                    dragStartPos.set(e.clientX, e.clientY);
+                    
+                    aimLine.visible = true;
+                    document.getElementById('power-meter').style.display = 'block';
+                }
+            }
+        }
+
+        function onMouseMove(e) {
+            if (!isDragging) return;
+
+            const deltaX = e.clientX - dragStartPos.x;
+            const deltaY = e.clientY - dragStartPos.y;
+            
+            // 计算力度 (屏幕像素距离)
+            const dist = Math.sqrt(deltaX*deltaX + deltaY*deltaY);
+            const maxDist = 300;
+            const powerPercent = Math.min(dist / maxDist, 1);
+
+            // 更新UI力度条
+            const bar = document.getElementById('power-bar');
+            bar.style.width = (powerPercent * 100) + '%';
+
+            // 3D 瞄准线逻辑
+            // 简单映射：鼠标向后拉，线向前指
+            // 获取相机方向在水平面的投影
+            const camDir = new THREE.Vector3();
+            camera.getWorldDirection(camDir);
+            camDir.y = 0;
+            camDir.normalize();
+            
+            const camRight = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0,1,0));
+
+            // 组合冲量方向
+            const impulseDir = new THREE.Vector3();
+            impulseDir.addScaledVector(camDir, -deltaY); // 鼠标向下(Y+) -> 冲量向后(负) -> 实际是拉杆，所以反向
+            impulseDir.addScaledVector(camRight, -deltaX);
+            impulseDir.normalize();
+
+            const lineLen = 5 * powerPercent;
+            
+            // 更新线的位置
+            const start = cueBall.mesh.position;
+            const end = new THREE.Vector3().copy(start).addScaledVector(impulseDir, lineLen); // 线指向击球方向
+            // 如果是拉弹弓模式，线应该指向球的后方，这里我们让线指向球的运动方向
+            
+            const positions = aimLine.geometry.attributes.position.array;
+            positions[0] = start.x; positions[1] = start.y; positions[2] = start.z;
+            positions[3] = end.x;   positions[4] = end.y;   positions[5] = end.z;
+            aimLine.geometry.attributes.position.needsUpdate = true;
+            
+            // 线条颜色随力度变化
+            aimLine.material.color.setHSL(0.3 * (1-powerPercent), 1, 0.5);
+        }
+
+        function onMouseUp(e) {
+            if (!isDragging) return;
+            
+            // 执行击球
+            const deltaX = e.clientX - dragStartPos.x;
+            const deltaY = e.clientY - dragStartPos.y;
+            const dist = Math.sqrt(deltaX*deltaX + deltaY*deltaY);
+            
+            // 计算方向
+            const camDir = new THREE.Vector3();
+            camera.getWorldDirection(camDir);
+            camDir.y = 0;
+            camDir.normalize();
+            const camRight = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0,1,0));
+            
+            const impulseVec = new THREE.Vector3();
+            // 拖拽方向与击球方向相反
+            impulseVec.addScaledVector(camDir, deltaY); 
+            impulseVec.addScaledVector(camRight, deltaX);
+            impulseVec.normalize();
+            
+            // 力度系数
+            const maxForce = 35;
+            const force = Math.min(dist / 300, 1) * maxForce;
+
+            // 施加冲量 (Cannon使用的是中心施力)
+            cueBall.body.wakeUp();
+            cueBall.body.applyImpulse(
+                new CANNON.Vec3(impulseVec.x * force, 0, impulseVec.z * force),
+                cueBall.body.position
+            );
+
+            // 重置状态
+            isDragging = false;
+            controls.enabled = true;
+            aimLine.visible = false;
+            document.getElementById('power-meter').style.display = 'none';
+            document.getElementById('power-bar').style.width = '0%';
+        }
+
+        // 6. 游戏逻辑检测
+        function checkGameRules() {
+            // 简单判定：如果球出了桌面范围或掉下去，视为进球
+            // 实际球袋坐标
+            const w = CONFIG.tableWidth;
+            const l = CONFIG.tableLength;
+            const pockets = [
+                {x: -w/2, z: -l/2}, {x: w/2, z: -l/2},
+                {x: -w/2, z: l/2}, {x: w/2, z: l/2},
+                {x: -w/2, z: 0}, {x: w/2, z: 0}
+            ];
+
+            for (let i = balls.length - 1; i >= 0; i--) {
+                const b = balls[i];
+                const pos = b.body.position;
+
+                // 掉出世界
+                let sunk = false;
+                if (pos.y < -2) sunk = true;
+
+                // 进袋判定 (距离检测)
+                if (!sunk) {
+                    for (let p of pockets) {
+                        const dx = pos.x - p.x;
+                        const dz = pos.z - p.z;
+                        if (dx*dx + dz*dz < CONFIG.pocketRadius * CONFIG.pocketRadius) {
+                            sunk = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (sunk) {
+                    if (b.isCue) {
+                        // 白球惩罚：重置位置
+                        b.body.velocity.set(0,0,0);
+                        b.body.angularVelocity.set(0,0,0);
+                        b.body.position.copy(b.startPos);
+                        // 简单的防止重叠逻辑
+                        b.body.position.y = CONFIG.ballRadius + 2; // 从上方落下
+                    } else {
+                        // 移除彩球
+                        world.removeBody(b.body);
+                        scene.remove(b.mesh);
+                        balls.splice(i, 1);
+                        score++;
+                        document.getElementById('score').innerText = score;
+                    }
+                }
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // 7. 主循环
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // 更新物理世界 (固定步长)
+            world.step(1/60);
+
+            // 同步 物理Body -> 视觉Mesh
+            balls.forEach(b => {
+                b.mesh.position.copy(b.body.position);
+                b.mesh.quaternion.copy(b.body.quaternion);
+            });
+
+            checkGameRules();
+            controls.update();
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
